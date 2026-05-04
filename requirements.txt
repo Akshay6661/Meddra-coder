@@ -1,0 +1,13 @@
+streamlit
+langchain
+langchain-openai
+langchain-core
+langgraph
+rapidfuzz
+rank-bm25
+pandas
+openpyxl
+nltk
+fastembed
+faiss-cpu
+pydantic
