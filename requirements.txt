@@ -12,3 +12,4 @@ fastembed
 faiss-cpu
 pydantic
 numpy
+gdown
