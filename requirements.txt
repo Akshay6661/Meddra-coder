@@ -8,8 +8,5 @@ rank-bm25
 pandas
 openpyxl
 nltk
-fastembed
-faiss-cpu
 pydantic
 numpy
-gdown
