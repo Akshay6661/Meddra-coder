@@ -98,13 +98,30 @@ st.markdown("""
 
 
 # ─── Load pipeline (cached — runs once per session) ───────────────────────────
-@st.cache_resource(show_spinner="⏳ Loading MedDRA v28.1 database & models...")
+@st.cache_resource(show_spinner=False)
 def load_pipeline(_api_key: str):
-    """Underscore prefix on arg tells Streamlit not to hash it."""
-    init_pipeline(
-        api_key=_api_key,
-        excel_path="MedDRA_LLT_PT_v28.1.xlsx",
-    )
+    
+    # ── Check if FAISS already built ─────────────────────────────
+    faiss_exists = os.path.exists("meddra_faiss.index") and \
+                   os.path.exists("meddra_faiss_meta.pkl")
+
+    if not faiss_exists:
+        # ── First time only — show progress bar ──────────────────
+        st.info("⏳ First time setup — building search index. This takes ~2 mins and won't happen again.")
+        bar = st.progress(0, text="📂 Loading MedDRA dataset...")
+
+        bar.progress(20, text="📂 Loading MedDRA dataset...")
+        init_pipeline(api_key=_api_key)
+
+        bar.progress(60, text="🔍 Building BM25 index...")
+        bar.progress(80, text="⚡ Building FAISS vector index (90k rows)...")
+        bar.progress(100, text="✅ Done! Ready to use.")
+        bar.empty()
+
+    else:
+        # ── Already built — load instantly ────────────────────────
+        with st.spinner("⚡ Loading search indexes..."):
+            init_pipeline(api_key=_api_key)
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
