@@ -98,29 +98,19 @@ st.markdown("""
 
 
 # ─── Load pipeline (cached — runs once per session) ───────────────────────────
+
 @st.cache_resource(show_spinner=False)
 def load_pipeline(_api_key: str):
-    
-    # ── Check if FAISS already built ─────────────────────────────
-    faiss_exists = os.path.exists("meddra_faiss.index") and \
-                   os.path.exists("meddra_faiss_meta.pkl")
+    faiss_exists = os.path.exists("meddra_faiss.index")
 
     if not faiss_exists:
-        # ── First time only — show progress bar ──────────────────
-        st.info("⏳ First time setup — building search index. This takes ~2 mins and won't happen again.")
-        bar = st.progress(0, text="📂 Loading MedDRA dataset...")
-
-        bar.progress(20, text="📂 Loading MedDRA dataset...")
+        st.info("⏳ First load — downloading search indexes from Drive (~1 min)")
+        bar = st.progress(0, text="📥 Downloading indexes...")
         init_pipeline(api_key=_api_key)
-
-        bar.progress(60, text="🔍 Building BM25 index...")
-        bar.progress(80, text="⚡ Building FAISS vector index (90k rows)...")
-        bar.progress(100, text="✅ Done! Ready to use.")
+        bar.progress(100, text="✅ Ready!")
         bar.empty()
-
     else:
-        # ── Already built — load instantly ────────────────────────
-        with st.spinner("⚡ Loading search indexes..."):
+        with st.spinner("⚡ Loading indexes..."):
             init_pipeline(api_key=_api_key)
 
 
