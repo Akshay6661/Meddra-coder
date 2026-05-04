@@ -1,0 +1,11 @@
+# API Keys
+.streamlit/secrets.toml
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Mac
+.DS_Store
