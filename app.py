@@ -3,8 +3,17 @@ app.py — Pharmacovigilance MedDRA Coding App
 Dataset: MedDRA_LLT_PT_v28.1.xlsx  (LLT Code | Decode | PT Code)
 Run: streamlit run app.py
 """
-
+import os
 import streamlit as st
+import pandas as pd
+from pipeline import init_pipeline, run_pipeline, lookup_llt, LLTResult
+
+
+# Push secrets into environment before pipeline loads
+os.environ["HUGGING_FACE_HUB_TOKEN"] = st.secrets.get("HF_TOKEN", "")
+os.environ["HF_TOKEN"] = st.secrets.get("HF_TOKEN", "")
+
+# ── Now import pipeline ───────────────────────────────────────────
 import pandas as pd
 from pipeline import init_pipeline, run_pipeline, lookup_llt, LLTResult
 
