@@ -11,3 +11,4 @@ nltk
 fastembed
 faiss-cpu
 pydantic
+numpy
