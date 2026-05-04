@@ -14,7 +14,7 @@ import nltk
 from typing import List, Dict
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
-
+import gdown
 # ─── Search libraries ─────────────────────────────────────────────────────────
 from rapidfuzz import process, fuzz
 from rank_bm25 import BM25Okapi
@@ -47,6 +47,42 @@ class LLTResult(BaseModel):
     pt_code:     int   = Field(..., description="MedDRA PT Code")
     search_tier: str   = Field(..., description="fuzzy | bm25 | vector | fuzzy_fallback")
     confidence:  float = Field(..., description="Match confidence score")
+
+
+
+
+
+# ── Google Drive File IDs ─────────────────────────────────────────
+GDRIVE_FAISS_INDEX_ID = "1ck8p-WHdd9C4hl6bofAqIBmN-_0wYsEs"
+GDRIVE_FAISS_META_ID  = "1u3jH4VKO9qC9RFYKs7k0bh7hzFb2mjt6"
+GDRIVE_BM25_ID        = "10Su2nO1TdJ4GnS8iyTAN3VmqcziesnhX"
+
+def download_from_drive():
+    """Download cache files from Google Drive if not present locally."""
+    if not os.path.exists(VECTOR_INDEX_PATH):
+        print("⏳ Downloading FAISS index from Google Drive...")
+        gdown.download(
+            f"https://drive.google.com/uc?id={GDRIVE_FAISS_INDEX_ID}",
+            VECTOR_INDEX_PATH,
+            quiet=False
+        )
+
+    if not os.path.exists(VECTOR_META_PATH):
+        print("⏳ Downloading FAISS meta from Google Drive...")
+        gdown.download(
+            f"https://drive.google.com/uc?id={GDRIVE_FAISS_META_ID}",
+            VECTOR_META_PATH,
+            quiet=False
+        )
+
+    if not os.path.exists(BM25_CACHE_PATH):
+        print("⏳ Downloading BM25 index from Google Drive...")
+        gdown.download(
+            f"https://drive.google.com/uc?id={GDRIVE_BM25_ID}",
+            BM25_CACHE_PATH,
+            quiet=False
+        )
+
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -169,6 +205,11 @@ Return ONLY a valid JSON array — no explanation, no markdown, no reasoning tex
 def init_pipeline(api_key: str, excel_path: str = EXCEL_FILE):
     global llt_df, bm25_index, decode_list_clean
     global embed_model, faiss_index, faiss_meta, llm, agent
+
+    # ── Download cache files if missing ──────────────────────────
+    download_from_drive()
+
+    # ... rest of init stays same
 
     # Tell fastembed to use local cache folder — no re-download
     os.environ["FASTEMBED_CACHE_PATH"] = FASTEMBED_CACHE
