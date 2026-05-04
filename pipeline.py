@@ -14,7 +14,7 @@ import nltk
 from typing import List, Dict
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
-
+os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ.get("HF_TOKEN", "")
 # ─── Search libraries ─────────────────────────────────────────────────────────
 from rapidfuzz import process, fuzz
 from rank_bm25 import BM25Okapi
