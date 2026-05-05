@@ -2,28 +2,27 @@
 pipeline.py — MedDRA Coding Pipeline (Production — Full 4-Layer System)
 Dataset : MedDRA_LLT_PT_v28.1.xlsx  (LLT Code | Decode | PT Code)
 Model   : openai/gpt-oss-120b via Euron
-Search  : 3-Tier Hybrid — Fuzzy → BM25 → Pinecone Vector
+Search  : 2-Tier Hybrid — Fuzzy → Pinecone Vector (BM25 removed)
 Validate: GPT validation — OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
-Fixes   : Full error handling + tenacity retry on all LLM calls
+Fixes   : Never cache empty results + full error handling + tenacity retry
 """
 
 import os, re, json, pickle, hashlib
 import pandas as pd
 import numpy as np
 import nltk
-from typing import List, Dict, Optional
+from typing import List, Dict
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 
 from rapidfuzz import process, fuzz
-from rank_bm25 import BM25Okapi
 from pinecone import Pinecone
 from fastembed import TextEmbedding
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -44,7 +43,7 @@ class LLTResult(BaseModel):
     decode:          str   = Field(..., description="Matched MedDRA Decode term")
     llt_code:        int   = Field(..., description="MedDRA LLT Code")
     pt_code:         int   = Field(..., description="MedDRA PT Code")
-    search_tier:     str   = Field(..., description="fuzzy | bm25 | vector | fuzzy_fallback")
+    search_tier:     str   = Field(..., description="fuzzy | vector | fuzzy_fallback")
     confidence:      float = Field(..., description="Match confidence 0-100")
     is_valid:        bool  = Field(..., description="GPT validation result")
     validation_note: str   = Field(..., description="GPT validation reason")
@@ -60,10 +59,9 @@ COL_LLT_CODE        = "LLT Code"
 COL_DECODE          = "Decode"
 COL_PT_CODE         = "PT Code"
 
-FUZZY_THRESHOLD     = 90      # high = only very close string matches pass
-BM25_THRESHOLD      = 12.0     # high = only strong keyword matches pass
+FUZZY_THRESHOLD     = 90       # only very close string matches pass
 VECTOR_TOP_N        = 3
-VECTOR_SCORE_MIN    = 0.55    # cosine similarity minimum for Pinecone
+VECTOR_SCORE_MIN    = 0.55
 
 BM25_CACHE_PATH     = "bm25_index.pkl"
 PINECONE_INDEX_NAME = "meddra-llt"
@@ -77,13 +75,13 @@ STOP_WORDS = set(stopwords.words("english"))
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 llt_df            = None
-bm25_index        = None
 decode_list_clean = None
 embed_model       = None
 pinecone_index    = None
 llm               = None
 agent             = None
 
+# ✅ Never stores empty results
 _result_cache: Dict[str, List[LLTResult]] = {}
 
 
@@ -155,10 +153,10 @@ Examples:
   Output: injection difficulty
 
   Input:  "couldn't have the daily dose"
-  Output: dose omission
+  Output: drug dose omission
 
   Input:  "returns of pen because of that"
-  Output: device return
+  Output: product complaint
 
   Input:  "Bemfola pen 75 IU was given to the patient"
   Output: wrong dose administered
@@ -167,7 +165,10 @@ Examples:
   Output: wrong product dispensed
 
   Input:  "SPC does not include information on the dose to be injected per pen"
-  Output: inadequate product information
+  Output: product information content complaint
+
+  Input:  "label does not include dosing information"
+  Output: product information content complaint
 
   Input:  "thinking that Bemfola is a multiple use pen"
   Output: device use error
@@ -183,15 +184,6 @@ Examples:
 
   Input:  "could not deliver the required dose"
   Output: drug delivery failure
-
-  Input:  "SPC does not include information on the dose to be injected per pen"
-  Output: product information content complaint
-
-  Input:  "label does not include dosing information"
-  Output: product information content complaint
-
-  Input:  "missing information in product leaflet"
-  Output: product information content complaint
 
   Input:  "information not provided to patient about dose"
   Output: product information not provided to patient
@@ -212,7 +204,7 @@ For EACH item:
 2. Use the top_match to get llt_code, pt_code, decode
 3. Preserve verbatim, event_type, simplified EXACTLY as given
 
-Return ONLY a valid JSON array — no explanation, no markdown, no reasoning:
+Return ONLY a valid JSON array no explanation no markdown no reasoning:
 [
   {
     "verbatim":    "exact original patient phrase",
@@ -221,7 +213,7 @@ Return ONLY a valid JSON array — no explanation, no markdown, no reasoning:
     "decode":      "matched MedDRA Decode term",
     "llt_code":    12345678,
     "pt_code":     12345678,
-    "search_tier": "fuzzy | bm25 | vector | fuzzy_fallback",
+    "search_tier": "fuzzy | vector | fuzzy_fallback",
     "confidence":  85.5
   }
 ]
@@ -265,24 +257,24 @@ Examples:
                "review_flag": "MANUAL_CODING_REQUIRED"}
 
   Verbatim:   "couldn't have the daily dose"
-  Simplified: "dose omission"
+  Simplified: "drug dose omission"
   Decode:     "Drug dose omission"
   Response:   {"is_valid": true, "confidence_adjustment": 8,
                "validation_note": "Exact MedDRA match for missed dose scenario",
                "review_flag": "OK"}
 
-  Verbatim:   "returns of pen because of that"
-  Simplified: "device return"
-  Decode:     "Device rupture"
-  Response:   {"is_valid": false, "confidence_adjustment": -30,
-               "validation_note": "Device rupture is incorrect pen return is a complaint not rupture",
-               "review_flag": "MANUAL_CODING_REQUIRED"}
+  Verbatim:   "SPC does not include information on dose"
+  Simplified: "product information content complaint"
+  Decode:     "Product information content complaint"
+  Response:   {"is_valid": true, "confidence_adjustment": 8,
+               "validation_note": "Correct match for missing SPC content",
+               "review_flag": "OK"}
 """
 
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_FILE):
-    global llt_df, bm25_index, decode_list_clean
+    global llt_df, decode_list_clean
     global embed_model, pinecone_index, llm, agent
 
     # ── 1. Load Excel ─────────────────────────────────────────────
@@ -296,24 +288,14 @@ def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_F
     llt_df["DECODE_CLEAN"] = llt_df[COL_DECODE].str.strip().str.lower()
     decode_list_clean = llt_df["DECODE_CLEAN"].tolist()
 
-    # ── 2. Load or build BM25 ─────────────────────────────────────
-    if os.path.exists(BM25_CACHE_PATH):
-        with open(BM25_CACHE_PATH, "rb") as f:
-            bm25_index = pickle.load(f)
-    else:
-        tokenized  = [_tokenize(n) for n in decode_list_clean]
-        bm25_index = BM25Okapi(tokenized)
-        with open(BM25_CACHE_PATH, "wb") as f:
-            pickle.dump(bm25_index, f)
-
-    # ── 3. Fastembed model for Pinecone queries ────────────────────
+    # ── 2. Fastembed model ────────────────────────────────────────
     embed_model = TextEmbedding(EMBED_MODEL_NAME)
 
-    # ── 4. Pinecone connection ─────────────────────────────────────
+    # ── 3. Pinecone connection ────────────────────────────────────
     pc = Pinecone(api_key=pinecone_api_key)
     pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
-    # ── 5. LLM temperature=0 + seed=42 for consistency ────────────
+    # ── 4. LLM temperature=0 + seed=42 for consistency ───────────
     llm = ChatOpenAI(
         model=MODEL_NAME,
         api_key=api_key,
@@ -323,7 +305,7 @@ def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_F
         seed=42,
     )
 
-    # ── 6. Build LangGraph agent ───────────────────────────────────
+    # ── 5. Build LangGraph agent ──────────────────────────────────
     _build_agent()
 
 
@@ -336,8 +318,7 @@ def _build_agent():
             sys_msg  = SystemMessage(content=_AGENT_SYSTEM_PROMPT)
             response = llm_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": [response]}
-        except Exception as e:
-            from langchain_core.messages import AIMessage
+        except Exception:
             return {"messages": [AIMessage(content="[]")]}
 
     tool_node = ToolNode([search_llt_tool])
@@ -351,11 +332,6 @@ def _build_agent():
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-def _tokenize(text: str) -> List[str]:
-    tokens = word_tokenize(str(text).lower())
-    return [t for t in tokens if t.isalpha() and t not in STOP_WORDS]
-
-
 def _row_to_dict(idx: int, score: float, method: str) -> Dict:
     row = llt_df.iloc[idx]
     return {
@@ -395,23 +371,7 @@ def _fuzzy_search(term: str) -> List[Dict]:
         return []
 
 
-# ─── Tier 2: BM25 ────────────────────────────────────────────────────────────
-def _bm25_search(term: str) -> List[Dict]:
-    try:
-        tokens = _tokenize(term)
-        if not tokens:
-            return []
-        scores   = bm25_index.get_scores(tokens)
-        top_idxs = np.argsort(scores)[::-1][:5]
-        return [
-            _row_to_dict(idx, scores[idx], "bm25")
-            for idx in top_idxs if scores[idx] > 0
-        ]
-    except Exception:
-        return []
-
-
-# ─── Tier 3: Pinecone Vector Search ──────────────────────────────────────────
+# ─── Tier 2: Pinecone Vector Search ──────────────────────────────────────────
 def _vector_search(term: str) -> List[Dict]:
     try:
         query_vec = list(embed_model.embed([term]))[0].tolist()
@@ -438,24 +398,19 @@ def _vector_search(term: str) -> List[Dict]:
         return []
 
 
-# ─── Hybrid Search Router ─────────────────────────────────────────────────────
+# ─── Hybrid Search — Fuzzy → Vector ──────────────────────────────────────────
 def hybrid_search(term: str) -> Dict:
     """
     Tier 1 Fuzzy  — exact/close string matches   score >= 90
-    Tier 2 BM25   — strong keyword matches        score >= 8.0
-    Tier 3 Vector — semantic meaning via Pinecone everything else
+    Tier 2 Vector — semantic meaning via Pinecone everything else
+    BM25 removed  — was causing wrong word matches
     """
     # Tier 1 — Fuzzy
     fuzzy = _fuzzy_search(term)
     if fuzzy and fuzzy[0]["score"] >= FUZZY_THRESHOLD:
         return {"term": term, "top_match": fuzzy[0], "search_used": "fuzzy"}
 
-    # # Tier 2 — BM25
-    # bm25 = _bm25_search(term)
-    # if bm25 and bm25[0]["score"] >= BM25_THRESHOLD:
-    #     return {"term": term, "top_match": bm25[0], "search_used": "bm25"}
-
-    # Tier 3 — Pinecone Vector
+    # Tier 2 — Pinecone Vector
     vector = _vector_search(term)
     if vector:
         return {"term": term, "top_match": vector[0], "search_used": "vector"}
@@ -473,7 +428,7 @@ def hybrid_search(term: str) -> Dict:
 def search_llt_tool(simplified_term: str) -> str:
     """
     Search MedDRA LLT dataset for a simplified medical term.
-    Uses 3-tier hybrid: Fuzzy → BM25 → Pinecone Vector.
+    Uses Fuzzy → Pinecone Vector hybrid search.
     Input: simplified medical concept NOT raw verbatim.
     """
     try:
@@ -567,49 +522,39 @@ def extract_verbatim(narrative: str) -> List[Dict]:
             elif isinstance(item, dict):
                 normalized.append(item)
         return normalized
-    except Exception:
-        return []
+    except Exception as e:
+        print(f"extract_verbatim error: {e}")
+        raise
 
 
-# ─── Main Pipeline ────────────────────────────────────────────────────────────
-def run_pipeline(narrative: str) -> List[LLTResult]:
+# ─── Layer 3+4: Run from extracted (called by app.py step by step) ───────────
+def run_pipeline_from_extracted(
+    narrative: str,
+    extracted: List[Dict]
+) -> List[LLTResult]:
     """
-    Full 4-layer pipeline with error handling + session caching.
-
-    Layer 1 → GPT extracts verbatims + event types
-    Layer 2 → GPT simplifies (strips brand/dose/date)
-    Layer 3 → Fuzzy + BM25 + Pinecone Vector finds best LLT
-    Layer 4 → GPT validates → OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
+    Run pipeline from step 3 onwards.
+    Called by app.py after extraction + simplification already done.
     """
-    # ── Cache check ───────────────────────────────────────────────
     cache_key = _narrative_hash(narrative)
-    if cache_key in _result_cache:
-        return _result_cache[cache_key]
-
-    # ── Layer 1: Extract ──────────────────────────────────────────
-    extracted = extract_verbatim(narrative)
-    if not extracted:
-        return []
-
-    # ── Layer 2: Simplify ─────────────────────────────────────────
-    for item in extracted:
-        item["simplified"] = simplify_verbatim(item["verbatim"])
 
     # ── Layer 3: LLT matching via agent ───────────────────────────
     try:
         agent_input = (
-            f"Match these terms to MedDRA LLTs using the simplified field:\n"
+            f"Match these terms to MedDRA LLTs using simplified field:\n"
             f"{json.dumps(extracted, indent=2)}"
         )
         with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-            output = agent.invoke({"messages": [HumanMessage(content=agent_input)]})
+            output = agent.invoke({
+                "messages": [HumanMessage(content=agent_input)]
+            })
 
         raw = output["messages"][-1].content.strip()
         json_start = raw.find("[")
         json_end   = raw.rfind("]")
         if json_start != -1 and json_end != -1:
             raw = raw[json_start: json_end + 1]
-        raw = re.sub(r"```json|```", "", raw).strip()
+        raw   = re.sub(r"```json|```", "", raw).strip()
         coded = json.loads(raw)
 
     except Exception as e:
@@ -618,23 +563,30 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
 
     if not coded:
         return []
-# ── Cache and return ──────────────────────────────────────────
-# Only cache if we got actual results — never cache empty
-    if results:
-        _result_cache[cache_key] = results
-    return results
+
     # ── Layer 4: Validate each match ──────────────────────────────
     results = []
     for item in coded:
         if not isinstance(item, dict):
             continue
         try:
-            verbatim   = item.get("verbatim", "")
-            simplified = item.get("simplified", "")
-            decode     = item.get("decode", "")
-            confidence = float(item.get("confidence", 50.0))
+            verbatim    = item.get("verbatim", "")
+            simplified  = item.get("simplified", "")
+            decode      = item.get("decode", "")
+            confidence  = float(item.get("confidence", 50.0))
+            search_tier = item.get("search_tier", "fuzzy_fallback")
 
-            validation       = validate_match(verbatim, simplified, decode)
+            # ✅ Skip validation for high confidence fuzzy — saves API calls
+            if search_tier == "fuzzy" and confidence >= 90:
+                validation = {
+                    "is_valid":              True,
+                    "confidence_adjustment": 5,
+                    "validation_note":       "High confidence fuzzy match — auto approved",
+                    "review_flag":           "OK"
+                }
+            else:
+                validation = validate_match(verbatim, simplified, decode)
+
             final_confidence = max(0.0, min(100.0,
                 confidence + validation["confidence_adjustment"]
             ))
@@ -649,7 +601,7 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
                 decode          = decode,
                 llt_code        = int(item.get("llt_code", 0)),
                 pt_code         = int(item.get("pt_code", 0)),
-                search_tier     = item.get("search_tier", "fuzzy_fallback"),
+                search_tier     = search_tier,
                 confidence      = round(final_confidence, 1),
                 is_valid        = validation["is_valid"],
                 validation_note = validation["validation_note"],
@@ -658,9 +610,46 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
         except Exception:
             continue
 
-    # ── Cache and return ──────────────────────────────────────────
-    _result_cache[cache_key] = results
+    # ✅ Only cache if we got actual results — never cache empty
+    if results:
+        _result_cache[cache_key] = results
     return results
+
+
+# ─── Main Pipeline (convenience wrapper) ──────────────────────────────────────
+def run_pipeline(narrative: str) -> List[LLTResult]:
+    """
+    Full 4-layer pipeline.
+    Checks cache first — only runs if no cached result exists.
+    Never caches empty results.
+    """
+    # ── Cache check ───────────────────────────────────────────────
+    cache_key = _narrative_hash(narrative)
+    if cache_key in _result_cache:
+        return _result_cache[cache_key]
+
+    # ── Layer 1: Extract ──────────────────────────────────────────
+    extracted = extract_verbatim(narrative)
+    if not extracted:
+        return []  # ← NOT cached — will retry next time
+
+    # ── Layer 2: Simplify ─────────────────────────────────────────
+    for item in extracted:
+        item["simplified"] = simplify_verbatim(item["verbatim"])
+
+    # ── Layers 3 + 4 ─────────────────────────────────────────────
+    return run_pipeline_from_extracted(narrative, extracted)
+
+
+# ─── Cache Management ─────────────────────────────────────────────────────────
+def clear_cache(narrative: str = None):
+    """Clear result cache — forces fresh API call."""
+    global _result_cache
+    if narrative:
+        cache_key = _narrative_hash(narrative)
+        _result_cache.pop(cache_key, None)
+    else:
+        _result_cache = {}
 
 
 # ─── Lookup Helper ────────────────────────────────────────────────────────────
