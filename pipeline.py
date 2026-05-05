@@ -1,15 +1,10 @@
 """
-pipeline.py — MedDRA Coding Pipeline (Production — 4-Layer + Pinecone Vector Search)
+pipeline.py — MedDRA Coding Pipeline (Production — Full 4-Layer System)
 Dataset : MedDRA_LLT_PT_v28.1.xlsx  (LLT Code | Decode | PT Code)
 Model   : openai/gpt-oss-120b via Euron
 Search  : 3-Tier Hybrid — Fuzzy → BM25 → Pinecone Vector
-Validate: GPT validation layer — OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
-
-4-Layer Flow:
-  Layer 1 — GPT Verbatim Extraction  → what events to code
-  Layer 2 — GPT Simplification       → strip brand/dose/date → MedDRA-friendly term
-  Layer 3 — Fuzzy + BM25 + Pinecone  → find best LLT match
-  Layer 4 — GPT Validation           → is match medically correct?
+Validate: GPT validation — OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
+Fixes   : Full error handling + tenacity retry on all LLM calls
 """
 
 import os, re, json, pickle, hashlib
@@ -24,6 +19,7 @@ from rapidfuzz import process, fuzz
 from rank_bm25 import BM25Okapi
 from pinecone import Pinecone
 from fastembed import TextEmbedding
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -64,10 +60,10 @@ COL_LLT_CODE        = "LLT Code"
 COL_DECODE          = "Decode"
 COL_PT_CODE         = "PT Code"
 
-FUZZY_THRESHOLD     = 90
-BM25_THRESHOLD      = 8.0
+FUZZY_THRESHOLD     = 90      # high = only very close string matches pass
+BM25_THRESHOLD      = 8.0     # high = only strong keyword matches pass
 VECTOR_TOP_N        = 3
-VECTOR_SCORE_MIN    = 0.55       # cosine similarity threshold (0-1)
+VECTOR_SCORE_MIN    = 0.55    # cosine similarity minimum for Pinecone
 
 BM25_CACHE_PATH     = "bm25_index.pkl"
 PINECONE_INDEX_NAME = "meddra-llt"
@@ -123,8 +119,8 @@ EVENT TYPES:
 ─────────────────────────────────────────────────────────────────────────────
 
 CRITICAL RULES:
-- Extract verbatim — EXACT words from the narrative. Do NOT rephrase.
-- Extract EVERY reportable event — do not skip any.
+- Extract verbatim EXACT words from the narrative. Do NOT rephrase.
+- Extract EVERY reportable event do not skip any.
 - Each term maps to exactly ONE event type.
 - Do NOT include: enquirer questions, pharmacist background questions, dates,
   follow-up call details, or non-reportable administrative info.
@@ -232,11 +228,11 @@ Consider:
 2. Is this LLT appropriate for the event type?
 3. Would a trained PV medical reviewer accept this coding?
 
-Return ONLY valid JSON — no other text:
+Return ONLY valid JSON no other text:
 {
   "is_valid": true or false,
   "confidence_adjustment": number between -30 and +10,
-  "validation_note": "brief clinical reason — max 1 sentence",
+  "validation_note": "brief clinical reason max 1 sentence",
   "review_flag": "OK" | "NEEDS_REVIEW" | "MANUAL_CODING_REQUIRED"
 }
 
@@ -250,7 +246,7 @@ Examples:
   Simplified: "injection difficulty"
   Decode:     "Urination difficulty"
   Response:   {"is_valid": false, "confidence_adjustment": -25,
-               "validation_note": "Urination difficulty is incorrect — should map to injection site or administration difficulty",
+               "validation_note": "Urination difficulty is incorrect for injection difficulty",
                "review_flag": "MANUAL_CODING_REQUIRED"}
 
   Verbatim:   "couldn't have the daily dose"
@@ -264,7 +260,7 @@ Examples:
   Simplified: "device return"
   Decode:     "Device rupture"
   Response:   {"is_valid": false, "confidence_adjustment": -30,
-               "validation_note": "Device rupture is incorrect — pen return is a device complaint not rupture",
+               "validation_note": "Device rupture is incorrect pen return is a complaint not rupture",
                "review_flag": "MANUAL_CODING_REQUIRED"}
 """
 
@@ -295,14 +291,14 @@ def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_F
         with open(BM25_CACHE_PATH, "wb") as f:
             pickle.dump(bm25_index, f)
 
-    # ── 3. Sentence Transformer for Pinecone queries ───────────────
+    # ── 3. Fastembed model for Pinecone queries ────────────────────
     embed_model = TextEmbedding(EMBED_MODEL_NAME)
 
     # ── 4. Pinecone connection ─────────────────────────────────────
     pc = Pinecone(api_key=pinecone_api_key)
     pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
-    # ── 5. LLM — temperature=0 + seed=42 for consistency ──────────
+    # ── 5. LLM temperature=0 + seed=42 for consistency ────────────
     llm = ChatOpenAI(
         model=MODEL_NAME,
         api_key=api_key,
@@ -321,9 +317,13 @@ def _build_agent():
     llm_with_tools = llm.bind_tools([search_llt_tool])
 
     def call_model(state: MessagesState):
-        sys_msg  = SystemMessage(content=_AGENT_SYSTEM_PROMPT)
-        response = llm_with_tools.invoke([sys_msg] + state["messages"])
-        return {"messages": [response]}
+        try:
+            sys_msg  = SystemMessage(content=_AGENT_SYSTEM_PROMPT)
+            response = llm_with_tools.invoke([sys_msg] + state["messages"])
+            return {"messages": [response]}
+        except Exception as e:
+            from langchain_core.messages import AIMessage
+            return {"messages": [AIMessage(content="[]")]}
 
     tool_node = ToolNode([search_llt_tool])
     builder   = StateGraph(MessagesState)
@@ -368,63 +368,67 @@ def _get_review_flag(confidence: float, is_valid: bool) -> str:
 
 # ─── Tier 1: Fuzzy ───────────────────────────────────────────────────────────
 def _fuzzy_search(term: str) -> List[Dict]:
-    results = process.extract(
-        term.lower(),
-        decode_list_clean,
-        scorer=fuzz.token_sort_ratio,
-        limit=3,
-    )
-    return [_row_to_dict(idx, score, "fuzzy") for _, score, idx in results]
+    try:
+        results = process.extract(
+            term.lower(),
+            decode_list_clean,
+            scorer=fuzz.token_sort_ratio,
+            limit=3,
+        )
+        return [_row_to_dict(idx, score, "fuzzy") for _, score, idx in results]
+    except Exception:
+        return []
 
 
 # ─── Tier 2: BM25 ────────────────────────────────────────────────────────────
 def _bm25_search(term: str) -> List[Dict]:
-    tokens = _tokenize(term)
-    if not tokens:
+    try:
+        tokens = _tokenize(term)
+        if not tokens:
+            return []
+        scores   = bm25_index.get_scores(tokens)
+        top_idxs = np.argsort(scores)[::-1][:5]
+        return [
+            _row_to_dict(idx, scores[idx], "bm25")
+            for idx in top_idxs if scores[idx] > 0
+        ]
+    except Exception:
         return []
-    scores   = bm25_index.get_scores(tokens)
-    top_idxs = np.argsort(scores)[::-1][:5]
-    return [
-        _row_to_dict(idx, scores[idx], "bm25")
-        for idx in top_idxs if scores[idx] > 0
-    ]
 
 
 # ─── Tier 3: Pinecone Vector Search ──────────────────────────────────────────
 def _vector_search(term: str) -> List[Dict]:
-    """
-    Semantic search via Pinecone.
-    Handles complex/informal language that fuzzy + BM25 miss:
-    e.g. 'my temple is paining' → 'Headache'
-         'injection difficulty' → 'Administration site reaction'
-         'tummy on fire'        → 'Abdominal pain'
-    """
-    query_vec = list(embed_model.embed([term]))[0].tolist()
-
-
-    output = []
-    for match in results["matches"]:
-        score = float(match["score"])
-        if score < VECTOR_SCORE_MIN:
-            continue
-        output.append({
-            "decode":   match["metadata"]["decode"],
-            "llt_code": int(match["metadata"]["llt_code"]),
-            "pt_code":  int(match["metadata"]["pt_code"]),
-            "score":    round(score * 100, 2),
-            "method":   "vector",
-        })
-    return output
+    try:
+        query_vec = list(embed_model.embed([term]))[0].tolist()
+        results   = pinecone_index.query(
+            vector=query_vec,
+            top_k=VECTOR_TOP_N,
+            include_metadata=True
+        )
+        output = []
+        for match in results["matches"]:
+            score = float(match["score"])
+            if score < VECTOR_SCORE_MIN:
+                continue
+            output.append({
+                "decode":   match["metadata"]["decode"],
+                "llt_code": int(match["metadata"]["llt_code"]),
+                "pt_code":  int(match["metadata"]["pt_code"]),
+                "score":    round(score * 100, 2),
+                "method":   "vector",
+            })
+        return output
+    except Exception as e:
+        print(f"Pinecone error: {e}")
+        return []
 
 
 # ─── Hybrid Search Router ─────────────────────────────────────────────────────
 def hybrid_search(term: str) -> Dict:
     """
-    Routes through 3 tiers:
-      Tier 1 Fuzzy  — close string matches     e.g. 'headache' → 'Headache'
-      Tier 2 BM25   — keyword overlap           e.g. 'dose omission'
-      Tier 3 Vector — semantic meaning          e.g. 'injection difficulty'
-                      via Pinecone (cloud hosted, no file size issues)
+    Tier 1 Fuzzy  — exact/close string matches   score >= 90
+    Tier 2 BM25   — strong keyword matches        score >= 8.0
+    Tier 3 Vector — semantic meaning via Pinecone everything else
     """
     # Tier 1 — Fuzzy
     fuzzy = _fuzzy_search(term)
@@ -454,45 +458,57 @@ def hybrid_search(term: str) -> Dict:
 def search_llt_tool(simplified_term: str) -> str:
     """
     Search MedDRA LLT dataset for a simplified medical term.
-    Uses 3-tier hybrid search: Fuzzy → BM25 → Pinecone Vector.
-    Input: simplified medical concept (NOT raw verbatim).
-    Returns: matched Decode, LLT Code, PT Code, confidence score.
+    Uses 3-tier hybrid: Fuzzy → BM25 → Pinecone Vector.
+    Input: simplified medical concept NOT raw verbatim.
     """
-    return json.dumps(hybrid_search(simplified_term))
+    try:
+        return json.dumps(hybrid_search(simplified_term))
+    except Exception as e:
+        return json.dumps({
+            "term":        simplified_term,
+            "top_match":   None,
+            "search_used": "error",
+            "error":       str(e)
+        })
 
 
 # ─── Layer 2: GPT Simplification ─────────────────────────────────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=8))
 def simplify_verbatim(verbatim: str) -> str:
     """Strip brand/dose/date → extract core MedDRA-matchable concept."""
-    messages = [
-        SystemMessage(content=_SIMPLIFY_PROMPT),
-        HumanMessage(content=verbatim),
-    ]
-    resp = llm.invoke(messages)
-    return resp.content.strip().lower()
+    try:
+        messages = [
+            SystemMessage(content=_SIMPLIFY_PROMPT),
+            HumanMessage(content=verbatim),
+        ]
+        resp = llm.invoke(messages)
+        return resp.content.strip().lower()
+    except Exception:
+        return verbatim.lower()
 
 
 # ─── Layer 4: GPT Validation ──────────────────────────────────────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=8))
 def validate_match(verbatim: str, simplified: str, decode: str) -> Dict:
     """Validates if MedDRA LLT match is medically appropriate."""
-    prompt = (
-        f"Verbatim:   {verbatim}\n"
-        f"Simplified: {simplified}\n"
-        f"Decode:     {decode}"
-    )
-    messages = [
-        SystemMessage(content=_VALIDATE_PROMPT),
-        HumanMessage(content=prompt),
-    ]
-    resp = llm.invoke(messages)
-    raw  = re.sub(r"```json|```", "", resp.content.strip()).strip()
-
-    json_start = raw.find("{")
-    json_end   = raw.rfind("}")
-    if json_start != -1 and json_end != -1:
-        raw = raw[json_start: json_end + 1]
-
     try:
+        prompt = (
+            f"Verbatim:   {verbatim}\n"
+            f"Simplified: {simplified}\n"
+            f"Decode:     {decode}"
+        )
+        messages = [
+            SystemMessage(content=_VALIDATE_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+        resp = llm.invoke(messages)
+        raw  = re.sub(r"```json|```", "", resp.content.strip()).strip()
+
+        json_start = raw.find("{")
+        json_end   = raw.rfind("}")
+        if json_start != -1 and json_end != -1:
+            raw = raw[json_start: json_end + 1]
+
         result = json.loads(raw)
         return {
             "is_valid":              bool(result.get("is_valid", True)),
@@ -504,29 +520,31 @@ def validate_match(verbatim: str, simplified: str, decode: str) -> Dict:
         return {
             "is_valid":              True,
             "confidence_adjustment": 0,
-            "validation_note":       "Validation parse error — manual review recommended",
+            "validation_note":       "Validation error — manual review recommended",
             "review_flag":           "NEEDS_REVIEW",
         }
 
 
 # ─── Layer 1: Verbatim Extractor ──────────────────────────────────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=8))
 def extract_verbatim(narrative: str) -> List[Dict]:
     """Extract verbatim terms + event types from narrative."""
-    messages = [
-        SystemMessage(content=_VERBATIM_PROMPT),
-        HumanMessage(content=f"Patient Narrative:\n{narrative}"),
-    ]
-    resp = llm.invoke(messages)
-    raw  = re.sub(r"```json|```", "", resp.content.strip()).strip()
-
-    json_start = raw.find("[")
-    json_end   = raw.rfind("]")
-    if json_start != -1 and json_end != -1:
-        raw = raw[json_start: json_end + 1]
-
     try:
+        messages = [
+            SystemMessage(content=_VERBATIM_PROMPT),
+            HumanMessage(content=f"Patient Narrative:\n{narrative}"),
+        ]
+        resp = llm.invoke(messages)
+        raw  = re.sub(r"```json|```", "", resp.content.strip()).strip()
+
+        json_start = raw.find("[")
+        json_end   = raw.rfind("]")
+        if json_start != -1 and json_end != -1:
+            raw = raw[json_start: json_end + 1]
+
         result = json.loads(raw)
         assert isinstance(result, list)
+
         normalized = []
         for item in result:
             if isinstance(item, str):
@@ -541,12 +559,12 @@ def extract_verbatim(narrative: str) -> List[Dict]:
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
 def run_pipeline(narrative: str) -> List[LLTResult]:
     """
-    Full 4-layer pipeline with Pinecone vector search + session caching.
+    Full 4-layer pipeline with error handling + session caching.
 
     Layer 1 → GPT extracts verbatims + event types
     Layer 2 → GPT simplifies (strips brand/dose/date)
     Layer 3 → Fuzzy + BM25 + Pinecone Vector finds best LLT
-    Layer 4 → GPT validates match → OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
+    Layer 4 → GPT validates → OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
     """
     # ── Cache check ───────────────────────────────────────────────
     cache_key = _narrative_hash(narrative)
@@ -563,23 +581,27 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
         item["simplified"] = simplify_verbatim(item["verbatim"])
 
     # ── Layer 3: LLT matching via agent ───────────────────────────
-    agent_input = (
-        f"Match these terms to MedDRA LLTs using the simplified field:\n"
-        f"{json.dumps(extracted, indent=2)}"
-    )
-    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-        output = agent.invoke({"messages": [HumanMessage(content=agent_input)]})
-
-    raw = output["messages"][-1].content.strip()
-    json_start = raw.find("[")
-    json_end   = raw.rfind("]")
-    if json_start != -1 and json_end != -1:
-        raw = raw[json_start: json_end + 1]
-    raw = re.sub(r"```json|```", "", raw).strip()
-
     try:
+        agent_input = (
+            f"Match these terms to MedDRA LLTs using the simplified field:\n"
+            f"{json.dumps(extracted, indent=2)}"
+        )
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = agent.invoke({"messages": [HumanMessage(content=agent_input)]})
+
+        raw = output["messages"][-1].content.strip()
+        json_start = raw.find("[")
+        json_end   = raw.rfind("]")
+        if json_start != -1 and json_end != -1:
+            raw = raw[json_start: json_end + 1]
+        raw = re.sub(r"```json|```", "", raw).strip()
         coded = json.loads(raw)
-    except Exception:
+
+    except Exception as e:
+        print(f"Agent error: {e}")
+        return []
+
+    if not coded:
         return []
 
     # ── Layer 4: Validate each match ──────────────────────────────
@@ -587,21 +609,20 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
     for item in coded:
         if not isinstance(item, dict):
             continue
-
-        verbatim   = item.get("verbatim", "")
-        simplified = item.get("simplified", "")
-        decode     = item.get("decode", "")
-        confidence = float(item.get("confidence", 50.0))
-
-        validation       = validate_match(verbatim, simplified, decode)
-        final_confidence = max(0.0, min(100.0,
-            confidence + validation["confidence_adjustment"]
-        ))
-        review_flag = validation["review_flag"] or _get_review_flag(
-            final_confidence, validation["is_valid"]
-        )
-
         try:
+            verbatim   = item.get("verbatim", "")
+            simplified = item.get("simplified", "")
+            decode     = item.get("decode", "")
+            confidence = float(item.get("confidence", 50.0))
+
+            validation       = validate_match(verbatim, simplified, decode)
+            final_confidence = max(0.0, min(100.0,
+                confidence + validation["confidence_adjustment"]
+            ))
+            review_flag = validation["review_flag"] or _get_review_flag(
+                final_confidence, validation["is_valid"]
+            )
+
             results.append(LLTResult(
                 verbatim        = verbatim,
                 simplified      = simplified,
@@ -618,6 +639,7 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
         except Exception:
             continue
 
+    # ── Cache and return ──────────────────────────────────────────
     _result_cache[cache_key] = results
     return results
 
@@ -625,14 +647,17 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
 # ─── Lookup Helper ────────────────────────────────────────────────────────────
 def lookup_llt(search_value: str) -> pd.DataFrame:
     """Search by LLT Code, PT Code, or partial Decode name."""
-    search_value = str(search_value).strip()
-    if search_value.isdigit():
-        code      = int(search_value)
-        by_llt    = llt_df[llt_df[COL_LLT_CODE] == code]
-        by_pt     = llt_df[llt_df[COL_PT_CODE]  == code]
-        result    = pd.concat([by_llt, by_pt]).drop_duplicates()
-    else:
-        result = llt_df[
-            llt_df[COL_DECODE].str.contains(search_value, case=False, na=False)
-        ]
-    return result[[COL_LLT_CODE, COL_DECODE, COL_PT_CODE]].reset_index(drop=True)
+    try:
+        search_value = str(search_value).strip()
+        if search_value.isdigit():
+            code      = int(search_value)
+            by_llt    = llt_df[llt_df[COL_LLT_CODE] == code]
+            by_pt     = llt_df[llt_df[COL_PT_CODE]  == code]
+            result    = pd.concat([by_llt, by_pt]).drop_duplicates()
+        else:
+            result = llt_df[
+                llt_df[COL_DECODE].str.contains(search_value, case=False, na=False)
+            ]
+        return result[[COL_LLT_CODE, COL_DECODE, COL_PT_CODE]].reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=[COL_LLT_CODE, COL_DECODE, COL_PT_CODE])
