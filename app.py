@@ -129,8 +129,6 @@ with st.sidebar:
     <div style='font-size:0.75rem; color:#718096; margin-top:0.5rem;'>
         <b>Dataset:</b> MedDRA v28.1<br>
         <b>Model:</b> openai/gpt-oss-120b<br>
-        <b>Search:</b> Fuzzy + BM25 + GPT Simplification<br>
-        <b>Consistency:</b> temperature=0 + result cache
     </div>
     """, unsafe_allow_html=True)
 
@@ -170,7 +168,7 @@ with st.sidebar:
 st.markdown("""
 <div class="header">
     <h1>💊 MedDRA Coding Agent</h1>
-    <p>Pharmacovigilance · MedDRA v28.1 · Medical Reviewer Grade · Consistent Output</p>
+    <p>Pharmacovigilance · Medical Reviewer Grade · Consistent Output</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -185,8 +183,7 @@ with st.spinner("Loading MedDRA database..."):
 # ─── Info box ────────────────────────────────────────────────────
 st.markdown("""
 <div class="info-box">
-    ℹ️ Same narrative will always produce the same output (temperature=0 + session cache).
-    Results are cached per narrative — re-running the same case is instant.
+    ℹ️ Only for testing purpose
 </div>
 """, unsafe_allow_html=True)
 
