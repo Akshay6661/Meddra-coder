@@ -97,6 +97,14 @@ EVENT_CONFIG = {
 }
 
 
+# ✅ Read both keys from secrets FIRST
+api_key      = st.secrets["EURON_API_KEY"]
+pinecone_key = st.secrets["PINECONE_API_KEY"]
+
+# ✅ Then load pipeline
+with st.spinner("Loading MedDRA database..."):
+    load_pipeline(api_key, pinecone_key)
+
 # ─── Load pipeline ────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_pipeline(_api_key: str, _pinecone_key: str):
@@ -105,11 +113,6 @@ def load_pipeline(_api_key: str, _pinecone_key: str):
         pinecone_api_key=_pinecone_key,
         excel_path="MedDRA_LLT_PT_v28.1.xlsx",
     )
-# Read Pinecone key from secrets
-pinecone_key = st.secrets.get("PINECONE_API_KEY", "")
-
-# Load pipeline
-load_pipeline(api_key, pinecone_key)
 
 # ─── Sidebar ─────────────────────────────────────────────────────
 with st.sidebar:
