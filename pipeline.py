@@ -61,7 +61,7 @@ COL_DECODE          = "Decode"
 COL_PT_CODE         = "PT Code"
 
 FUZZY_THRESHOLD     = 90      # high = only very close string matches pass
-BM25_THRESHOLD      = 8.0     # high = only strong keyword matches pass
+BM25_THRESHOLD      = 12.0     # high = only strong keyword matches pass
 VECTOR_TOP_N        = 3
 VECTOR_SCORE_MIN    = 0.55    # cosine similarity minimum for Pinecone
 
@@ -183,6 +183,21 @@ Examples:
 
   Input:  "could not deliver the required dose"
   Output: drug delivery failure
+
+  Input:  "SPC does not include information on the dose to be injected per pen"
+  Output: product information content complaint
+
+  Input:  "label does not include dosing information"
+  Output: product information content complaint
+
+  Input:  "missing information in product leaflet"
+  Output: product information content complaint
+
+  Input:  "information not provided to patient about dose"
+  Output: product information not provided to patient
+
+  Input:  "incorrect information in SPC"
+  Output: misleading product information
 """
 
 
