@@ -65,7 +65,7 @@ COL_DECODE          = "Decode"
 COL_PT_CODE         = "PT Code"
 
 FUZZY_THRESHOLD     = 90
-BM25_THRESHOLD      = 2.0
+BM25_THRESHOLD      = 8.0
 VECTOR_TOP_N        = 3
 VECTOR_SCORE_MIN    = 0.55       # cosine similarity threshold (0-1)
 
