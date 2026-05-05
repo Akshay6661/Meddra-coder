@@ -1,15 +1,15 @@
 """
-pipeline.py — MedDRA Coding Pipeline (Production — 4-Layer System)
+pipeline.py — MedDRA Coding Pipeline (Production — 4-Layer + Pinecone Vector Search)
 Dataset : MedDRA_LLT_PT_v28.1.xlsx  (LLT Code | Decode | PT Code)
 Model   : openai/gpt-oss-120b via Euron
-Search  : Fuzzy + BM25 + GPT Simplification + GPT Validation
+Search  : 3-Tier Hybrid — Fuzzy → BM25 → Pinecone Vector
+Validate: GPT validation layer — OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
 
 4-Layer Flow:
   Layer 1 — GPT Verbatim Extraction  → what events to code
   Layer 2 — GPT Simplification       → strip brand/dose/date → MedDRA-friendly term
-  Layer 3 — Fuzzy + BM25 Search      → find best LLT match
+  Layer 3 — Fuzzy + BM25 + Pinecone  → find best LLT match
   Layer 4 — GPT Validation           → is match medically correct?
-                                        flags low confidence for human review
 """
 
 import os, re, json, pickle, hashlib
@@ -22,6 +22,8 @@ from io import StringIO
 
 from rapidfuzz import process, fuzz
 from rank_bm25 import BM25Okapi
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -40,52 +42,56 @@ from nltk.corpus import stopwords
 
 # ─── Pydantic Output Model ────────────────────────────────────────────────────
 class LLTResult(BaseModel):
-    verbatim:         str   = Field(..., description="Exact patient phrase")
-    simplified:       str   = Field(..., description="Simplified term used for MedDRA search")
-    event_type:       str   = Field(..., description="adverse_event | device_issue | medication_error | product_quality | lack_of_efficacy | other")
-    decode:           str   = Field(..., description="Matched MedDRA Decode term")
-    llt_code:         int   = Field(..., description="MedDRA LLT Code")
-    pt_code:          int   = Field(..., description="MedDRA PT Code")
-    search_tier:      str   = Field(..., description="fuzzy | bm25 | fuzzy_fallback")
-    confidence:       float = Field(..., description="Search confidence 0-100")
-    is_valid:         bool  = Field(..., description="GPT validation — is match medically correct?")
-    validation_note:  str   = Field(..., description="GPT validation reason / reviewer note")
-    review_flag:      str   = Field(..., description="OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED")
+    verbatim:        str   = Field(..., description="Exact patient phrase")
+    simplified:      str   = Field(..., description="Simplified term used for MedDRA search")
+    event_type:      str   = Field(..., description="adverse_event | device_issue | medication_error | product_quality | lack_of_efficacy | other")
+    decode:          str   = Field(..., description="Matched MedDRA Decode term")
+    llt_code:        int   = Field(..., description="MedDRA LLT Code")
+    pt_code:         int   = Field(..., description="MedDRA PT Code")
+    search_tier:     str   = Field(..., description="fuzzy | bm25 | vector | fuzzy_fallback")
+    confidence:      float = Field(..., description="Match confidence 0-100")
+    is_valid:        bool  = Field(..., description="GPT validation result")
+    validation_note: str   = Field(..., description="GPT validation reason")
+    review_flag:     str   = Field(..., description="OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED")
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-EXCEL_FILE      = "MedDRA_LLT_PT_v28.1.xlsx"
-EURON_BASE_URL  = "https://api.euron.one/api/v1/euri"
-MODEL_NAME      = "openai/gpt-oss-120b"
+EXCEL_FILE          = "MedDRA_LLT_PT_v28.1.xlsx"
+EURON_BASE_URL      = "https://api.euron.one/api/v1/euri"
+MODEL_NAME          = "openai/gpt-oss-120b"
 
-COL_LLT_CODE    = "LLT Code"
-COL_DECODE      = "Decode"
-COL_PT_CODE     = "PT Code"
+COL_LLT_CODE        = "LLT Code"
+COL_DECODE          = "Decode"
+COL_PT_CODE         = "PT Code"
 
-FUZZY_THRESHOLD = 80
-BM25_THRESHOLD  = 2.0
-BM25_CACHE_PATH = "bm25_index.pkl"
-STOP_WORDS      = set(stopwords.words("english"))
+FUZZY_THRESHOLD     = 80
+BM25_THRESHOLD      = 2.0
+VECTOR_TOP_N        = 3
+VECTOR_SCORE_MIN    = 0.70       # cosine similarity threshold (0-1)
 
-# Confidence thresholds for review flagging
-CONFIDENCE_OK            = 75    # >= 75 → OK
-CONFIDENCE_NEEDS_REVIEW  = 40    # 40-74 → NEEDS_REVIEW
-                                  # <  40 → MANUAL_CODING_REQUIRED
+BM25_CACHE_PATH     = "bm25_index.pkl"
+PINECONE_INDEX_NAME = "meddra-llt"
+EMBED_MODEL_NAME    = "all-MiniLM-L6-v2"
+
+CONFIDENCE_OK           = 75
+CONFIDENCE_NEEDS_REVIEW = 40
+
+STOP_WORDS = set(stopwords.words("english"))
 
 
 # ─── Globals ──────────────────────────────────────────────────────────────────
 llt_df            = None
 bm25_index        = None
 decode_list_clean = None
+embed_model       = None
+pinecone_index    = None
 llm               = None
 agent             = None
 
-# Session cache — same narrative → same result always
 _result_cache: Dict[str, List[LLTResult]] = {}
 
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
-
 _VERBATIM_PROMPT = """
 You are a senior Pharmacovigilance medical reviewer with 20 years experience in
 adverse event reporting, medical device vigilance, and medication error detection.
@@ -111,8 +117,7 @@ EVENT TYPES:
                             "tablet discoloured", "inadequate product labelling"
 
 5. lack_of_efficacy  → Drug or device not working as expected
-                       e.g. "dose could not be delivered", "treatment not effective",
-                            "no improvement after treatment"
+                       e.g. "dose could not be delivered", "treatment not effective"
 
 6. other             → Any other reportable event not fitting above
 ─────────────────────────────────────────────────────────────────────────────
@@ -130,15 +135,6 @@ Output format:
   {"verbatim": "exact phrase from narrative", "event_type": "medication_error"},
   {"verbatim": "exact phrase from narrative", "event_type": "device_issue"}
 ]
-
-Examples for complex PV narrative:
-  Input: "Patient had difficulty injecting the prescribed dose. The Bemfola pen
-          was returned. SPC does not include information on dose per pen."
-  Output: [
-    {"verbatim": "difficulty injecting the prescribed dose",          "event_type": "device_issue"},
-    {"verbatim": "Bemfola pen was returned",                          "event_type": "device_issue"},
-    {"verbatim": "SPC does not include information on dose per pen",  "event_type": "product_quality"}
-  ]
 """
 
 
@@ -186,11 +182,11 @@ Examples:
   Input:  "felt nauseous and dizzy after injection"
   Output: nausea and dizziness
 
+  Input:  "my temple is paining"
+  Output: headache
+
   Input:  "could not deliver the required dose"
   Output: drug delivery failure
-
-  Input:  "prescribed wrong biosimilar"
-  Output: wrong drug prescribed
 """
 
 
@@ -214,7 +210,7 @@ Return ONLY a valid JSON array — no explanation, no markdown, no reasoning:
     "decode":      "matched MedDRA Decode term",
     "llt_code":    12345678,
     "pt_code":     12345678,
-    "search_tier": "fuzzy | bm25 | fuzzy_fallback",
+    "search_tier": "fuzzy | bm25 | vector | fuzzy_fallback",
     "confidence":  85.5
   }
 ]
@@ -229,11 +225,11 @@ Given:
 - Simplified medical term used for MedDRA search
 - Matched MedDRA LLT (Decode) term
 
-Your job: Decide if the MedDRA match is medically appropriate for pharmacovigilance reporting.
+Decide if the MedDRA match is medically appropriate for pharmacovigilance reporting.
 
 Consider:
-1. Does the LLT term correctly represent the medical event described?
-2. Is this LLT appropriate for the event type (AE, device issue, med error etc)?
+1. Does the LLT correctly represent the medical event described?
+2. Is this LLT appropriate for the event type?
 3. Would a trained PV medical reviewer accept this coding?
 
 Return ONLY valid JSON — no other text:
@@ -245,45 +241,46 @@ Return ONLY valid JSON — no other text:
 }
 
 Review flag rules:
-  OK                     → match is medically appropriate, high confidence
+  OK                     → match is medically appropriate
   NEEDS_REVIEW           → match is plausible but reviewer should verify
   MANUAL_CODING_REQUIRED → match is wrong or no appropriate LLT found
 
 Examples:
   Verbatim:   "difficulty injecting the prescribed dose"
   Simplified: "injection difficulty"
-  Decode:     "Injection site pain"
-  Response:   {"is_valid": false, "confidence_adjustment": -20,
-               "validation_note": "Injection difficulty maps better to Administration site reaction than injection site pain",
-               "review_flag": "NEEDS_REVIEW"}
+  Decode:     "Urination difficulty"
+  Response:   {"is_valid": false, "confidence_adjustment": -25,
+               "validation_note": "Urination difficulty is incorrect — should map to injection site or administration difficulty",
+               "review_flag": "MANUAL_CODING_REQUIRED"}
 
   Verbatim:   "couldn't have the daily dose"
   Simplified: "dose omission"
-  Decode:     "Dose omission"
-  Response:   {"is_valid": true, "confidence_adjustment": 5,
+  Decode:     "Drug dose omission"
+  Response:   {"is_valid": true, "confidence_adjustment": 8,
                "validation_note": "Exact MedDRA match for missed dose scenario",
                "review_flag": "OK"}
 
-  Verbatim:   "Bemfola pen 75 IU was given to the patient"
-  Simplified: "wrong dose administered"
-  Decode:     "Child given for adoption"
+  Verbatim:   "returns of pen because of that"
+  Simplified: "device return"
+  Decode:     "Device rupture"
   Response:   {"is_valid": false, "confidence_adjustment": -30,
-               "validation_note": "Completely incorrect match — manual coding required",
+               "validation_note": "Device rupture is incorrect — pen return is a device complaint not rupture",
                "review_flag": "MANUAL_CODING_REQUIRED"}
 """
 
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
-def init_pipeline(api_key: str, excel_path: str = EXCEL_FILE):
-    global llt_df, bm25_index, decode_list_clean, llm, agent
+def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_FILE):
+    global llt_df, bm25_index, decode_list_clean
+    global embed_model, pinecone_index, llm, agent
 
     # ── 1. Load Excel ─────────────────────────────────────────────
     llt_df = pd.read_excel(excel_path)
     llt_df.columns = llt_df.columns.str.strip()
 
-    assert COL_LLT_CODE in llt_df.columns, f"Missing column: {COL_LLT_CODE}"
-    assert COL_DECODE   in llt_df.columns, f"Missing column: {COL_DECODE}"
-    assert COL_PT_CODE  in llt_df.columns, f"Missing column: {COL_PT_CODE}"
+    assert COL_LLT_CODE in llt_df.columns, f"Missing: {COL_LLT_CODE}"
+    assert COL_DECODE   in llt_df.columns, f"Missing: {COL_DECODE}"
+    assert COL_PT_CODE  in llt_df.columns, f"Missing: {COL_PT_CODE}"
 
     llt_df["DECODE_CLEAN"] = llt_df[COL_DECODE].str.strip().str.lower()
     decode_list_clean = llt_df["DECODE_CLEAN"].tolist()
@@ -298,7 +295,14 @@ def init_pipeline(api_key: str, excel_path: str = EXCEL_FILE):
         with open(BM25_CACHE_PATH, "wb") as f:
             pickle.dump(bm25_index, f)
 
-    # ── 3. LLM — temperature=0 + seed=42 for consistency ─────────
+    # ── 3. Sentence Transformer for Pinecone queries ───────────────
+    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+    # ── 4. Pinecone connection ─────────────────────────────────────
+    pc = Pinecone(api_key=pinecone_api_key)
+    pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+
+    # ── 5. LLM — temperature=0 + seed=42 for consistency ──────────
     llm = ChatOpenAI(
         model=MODEL_NAME,
         api_key=api_key,
@@ -308,7 +312,7 @@ def init_pipeline(api_key: str, excel_path: str = EXCEL_FILE):
         seed=42,
     )
 
-    # ── 4. Build LangGraph agent ──────────────────────────────────
+    # ── 6. Build LangGraph agent ───────────────────────────────────
     _build_agent()
 
 
@@ -340,11 +344,11 @@ def _tokenize(text: str) -> List[str]:
 def _row_to_dict(idx: int, score: float, method: str) -> Dict:
     row = llt_df.iloc[idx]
     return {
-        "decode":      row[COL_DECODE],
-        "llt_code":    int(row[COL_LLT_CODE]),
-        "pt_code":     int(row[COL_PT_CODE]),
-        "score":       round(float(score), 2),
-        "method":      method,
+        "decode":   row[COL_DECODE],
+        "llt_code": int(row[COL_LLT_CODE]),
+        "pt_code":  int(row[COL_PT_CODE]),
+        "score":    round(float(score), 2),
+        "method":   method,
     }
 
 
@@ -386,21 +390,82 @@ def _bm25_search(term: str) -> List[Dict]:
     ]
 
 
-# ─── Hybrid Search ───────────────────────────────────────────────────────────
+# ─── Tier 3: Pinecone Vector Search ──────────────────────────────────────────
+def _vector_search(term: str) -> List[Dict]:
+    """
+    Semantic search via Pinecone.
+    Handles complex/informal language that fuzzy + BM25 miss:
+    e.g. 'my temple is paining' → 'Headache'
+         'injection difficulty' → 'Administration site reaction'
+         'tummy on fire'        → 'Abdominal pain'
+    """
+    query_vec = embed_model.encode(
+        [term], normalize_embeddings=True
+    ).tolist()[0]
+
+    results = pinecone_index.query(
+        vector=query_vec,
+        top_k=VECTOR_TOP_N,
+        include_metadata=True
+    )
+
+    output = []
+    for match in results["matches"]:
+        score = float(match["score"])
+        if score < VECTOR_SCORE_MIN:
+            continue
+        output.append({
+            "decode":   match["metadata"]["decode"],
+            "llt_code": int(match["metadata"]["llt_code"]),
+            "pt_code":  int(match["metadata"]["pt_code"]),
+            "score":    round(score * 100, 2),
+            "method":   "vector",
+        })
+    return output
+
+
+# ─── Hybrid Search Router ─────────────────────────────────────────────────────
 def hybrid_search(term: str) -> Dict:
+    """
+    Routes through 3 tiers:
+      Tier 1 Fuzzy  — close string matches     e.g. 'headache' → 'Headache'
+      Tier 2 BM25   — keyword overlap           e.g. 'dose omission'
+      Tier 3 Vector — semantic meaning          e.g. 'injection difficulty'
+                      via Pinecone (cloud hosted, no file size issues)
+    """
+    # Tier 1 — Fuzzy
     fuzzy = _fuzzy_search(term)
     if fuzzy and fuzzy[0]["score"] >= FUZZY_THRESHOLD:
         return {"term": term, "top_match": fuzzy[0], "search_used": "fuzzy"}
 
+    # Tier 2 — BM25
     bm25 = _bm25_search(term)
     if bm25 and bm25[0]["score"] >= BM25_THRESHOLD:
         return {"term": term, "top_match": bm25[0], "search_used": "bm25"}
 
+    # Tier 3 — Pinecone Vector
+    vector = _vector_search(term)
+    if vector:
+        return {"term": term, "top_match": vector[0], "search_used": "vector"}
+
+    # Absolute fallback
     return {
         "term":        term,
         "top_match":   fuzzy[0] if fuzzy else None,
         "search_used": "fuzzy_fallback",
     }
+
+
+# ─── LangChain Tool ───────────────────────────────────────────────────────────
+@tool
+def search_llt_tool(simplified_term: str) -> str:
+    """
+    Search MedDRA LLT dataset for a simplified medical term.
+    Uses 3-tier hybrid search: Fuzzy → BM25 → Pinecone Vector.
+    Input: simplified medical concept (NOT raw verbatim).
+    Returns: matched Decode, LLT Code, PT Code, confidence score.
+    """
+    return json.dumps(hybrid_search(simplified_term))
 
 
 # ─── Layer 2: GPT Simplification ─────────────────────────────────────────────
@@ -416,10 +481,7 @@ def simplify_verbatim(verbatim: str) -> str:
 
 # ─── Layer 4: GPT Validation ──────────────────────────────────────────────────
 def validate_match(verbatim: str, simplified: str, decode: str) -> Dict:
-    """
-    Validates if MedDRA LLT match is medically appropriate.
-    Returns: is_valid, confidence_adjustment, validation_note, review_flag
-    """
+    """Validates if MedDRA LLT match is medically appropriate."""
     prompt = (
         f"Verbatim:   {verbatim}\n"
         f"Simplified: {simplified}\n"
@@ -440,10 +502,10 @@ def validate_match(verbatim: str, simplified: str, decode: str) -> Dict:
     try:
         result = json.loads(raw)
         return {
-            "is_valid":             bool(result.get("is_valid", True)),
+            "is_valid":              bool(result.get("is_valid", True)),
             "confidence_adjustment": float(result.get("confidence_adjustment", 0)),
-            "validation_note":      str(result.get("validation_note", "")),
-            "review_flag":          str(result.get("review_flag", "NEEDS_REVIEW")),
+            "validation_note":       str(result.get("validation_note", "")),
+            "review_flag":           str(result.get("review_flag", "NEEDS_REVIEW")),
         }
     except Exception:
         return {
@@ -452,18 +514,6 @@ def validate_match(verbatim: str, simplified: str, decode: str) -> Dict:
             "validation_note":       "Validation parse error — manual review recommended",
             "review_flag":           "NEEDS_REVIEW",
         }
-
-
-# ─── LangChain Tool ───────────────────────────────────────────────────────────
-@tool
-def search_llt_tool(simplified_term: str) -> str:
-    """
-    Search MedDRA LLT dataset for a simplified medical term.
-    Uses Fuzzy → BM25 hybrid search.
-    Input: simplified medical concept (NOT raw verbatim).
-    Returns: matched Decode, LLT Code, PT Code, confidence score.
-    """
-    return json.dumps(hybrid_search(simplified_term))
 
 
 # ─── Layer 1: Verbatim Extractor ──────────────────────────────────────────────
@@ -498,25 +548,24 @@ def extract_verbatim(narrative: str) -> List[Dict]:
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
 def run_pipeline(narrative: str) -> List[LLTResult]:
     """
-    Full 4-layer pipeline with session caching for consistency.
+    Full 4-layer pipeline with Pinecone vector search + session caching.
 
     Layer 1 → GPT extracts verbatims + event types
-    Layer 2 → GPT simplifies each verbatim (strips brand/dose/date)
-    Layer 3 → Fuzzy + BM25 finds best MedDRA LLT match
-    Layer 4 → GPT validates match is medically correct
-              flags: OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
+    Layer 2 → GPT simplifies (strips brand/dose/date)
+    Layer 3 → Fuzzy + BM25 + Pinecone Vector finds best LLT
+    Layer 4 → GPT validates match → OK | NEEDS_REVIEW | MANUAL_CODING_REQUIRED
     """
-    # ── Cache check — same narrative = same result ─────────────────
+    # ── Cache check ───────────────────────────────────────────────
     cache_key = _narrative_hash(narrative)
     if cache_key in _result_cache:
         return _result_cache[cache_key]
 
-    # ── Layer 1: Extract verbatims ────────────────────────────────
+    # ── Layer 1: Extract ──────────────────────────────────────────
     extracted = extract_verbatim(narrative)
     if not extracted:
         return []
 
-    # ── Layer 2: Simplify each verbatim ───────────────────────────
+    # ── Layer 2: Simplify ─────────────────────────────────────────
     for item in extracted:
         item["simplified"] = simplify_verbatim(item["verbatim"])
 
@@ -551,15 +600,10 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
         decode     = item.get("decode", "")
         confidence = float(item.get("confidence", 50.0))
 
-        # Run GPT validation
-        validation = validate_match(verbatim, simplified, decode)
-
-        # Adjust confidence based on validation
+        validation       = validate_match(verbatim, simplified, decode)
         final_confidence = max(0.0, min(100.0,
             confidence + validation["confidence_adjustment"]
         ))
-
-        # Determine review flag
         review_flag = validation["review_flag"] or _get_review_flag(
             final_confidence, validation["is_valid"]
         )
@@ -581,7 +625,6 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
         except Exception:
             continue
 
-    # ── Cache and return ──────────────────────────────────────────
     _result_cache[cache_key] = results
     return results
 
