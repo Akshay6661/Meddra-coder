@@ -11,7 +11,12 @@ os.environ["HUGGING_FACE_HUB_TOKEN"] = st.secrets.get("HF_TOKEN", "")
 os.environ["HF_TOKEN"]               = st.secrets.get("HF_TOKEN", "")
 
 import pandas as pd
-from pipeline import init_pipeline, run_pipeline, lookup_llt, LLTResult
+from pipeline import (
+    init_pipeline, run_pipeline,
+    run_pipeline_from_extracted,
+    extract_verbatim, simplify_verbatim,
+    lookup_llt, LLTResult, clear_cache
+)
 
 # ─── Page config ─────────────────────────────────────────────────
 st.set_page_config(
