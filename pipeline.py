@@ -23,7 +23,7 @@ from io import StringIO
 from rapidfuzz import process, fuzz
 from rank_bm25 import BM25Okapi
 from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -296,7 +296,7 @@ def init_pipeline(api_key: str, pinecone_api_key: str, excel_path: str = EXCEL_F
             pickle.dump(bm25_index, f)
 
     # ── 3. Sentence Transformer for Pinecone queries ───────────────
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    embed_model = TextEmbedding(EMBED_MODEL_NAME)
 
     # ── 4. Pinecone connection ─────────────────────────────────────
     pc = Pinecone(api_key=pinecone_api_key)
@@ -399,15 +399,8 @@ def _vector_search(term: str) -> List[Dict]:
          'injection difficulty' → 'Administration site reaction'
          'tummy on fire'        → 'Abdominal pain'
     """
-    query_vec = embed_model.encode(
-        [term], normalize_embeddings=True
-    ).tolist()[0]
+    query_vec = list(embed_model.embed([term]))[0].tolist()
 
-    results = pinecone_index.query(
-        vector=query_vec,
-        top_k=VECTOR_TOP_N,
-        include_metadata=True
-    )
 
     output = []
     for match in results["matches"]:
