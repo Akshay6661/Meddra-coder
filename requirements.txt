@@ -10,3 +10,5 @@ openpyxl
 nltk
 pydantic
 numpy
+pinecone
+sentence-transformers
