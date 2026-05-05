@@ -450,10 +450,10 @@ def hybrid_search(term: str) -> Dict:
     if fuzzy and fuzzy[0]["score"] >= FUZZY_THRESHOLD:
         return {"term": term, "top_match": fuzzy[0], "search_used": "fuzzy"}
 
-    # Tier 2 — BM25
-    bm25 = _bm25_search(term)
-    if bm25 and bm25[0]["score"] >= BM25_THRESHOLD:
-        return {"term": term, "top_match": bm25[0], "search_used": "bm25"}
+    # # Tier 2 — BM25
+    # bm25 = _bm25_search(term)
+    # if bm25 and bm25[0]["score"] >= BM25_THRESHOLD:
+    #     return {"term": term, "top_match": bm25[0], "search_used": "bm25"}
 
     # Tier 3 — Pinecone Vector
     vector = _vector_search(term)
