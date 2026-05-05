@@ -11,4 +11,4 @@ nltk
 pydantic
 numpy
 pinecone
-sentence-transformers
+fastembed
