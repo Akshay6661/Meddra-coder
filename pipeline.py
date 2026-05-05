@@ -53,7 +53,7 @@ class LLTResult(BaseModel):
 # ─── Config ───────────────────────────────────────────────────────────────────
 EXCEL_FILE          = "MedDRA_LLT_PT_v28.1.xlsx"
 EURON_BASE_URL      = "https://api.euron.one/api/v1/euri"
-MODEL_NAME          = "openai/gpt-oss-120b"
+MODEL_NAME          = "gpt-4"
 
 COL_LLT_CODE        = "LLT Code"
 COL_DECODE          = "Decode"
