@@ -139,24 +139,22 @@ Given a verbatim phrase from a pharmacovigilance report, extract ONLY the core
 medical/clinical concept that would match a MedDRA LLT term.
 
 RULES:
-- Remove: brand names (Bemfola, Gonal-F etc), drug names, IU doses, dates,
-  numbers, patient details, route of admin, lot numbers
+- Remove: brand names (Bemfola, Gonal-F, Humira etc), drug names, IU doses,
+  dates, numbers, patient details, route of admin, lot numbers
 - Keep: the core medical event, device problem, or medication error concept
 - Output must be a short clean phrase matching MedDRA terminology style
 - Return ONLY the simplified term. No explanation. No punctuation at the end.
+- Be consistent — same type of event always maps to same simplified term
+
+DEVICE RETURN / COMPLAINT RULES:
+- Any pen return, device return, product sent back = device complaint
+- Never use "device returned by patient" — always use "device complaint"
 
 Examples:
+
+  # ── Medication Errors ─────────────────────────────────────
   Input:  "dispensed a Bemfola 450 IU on 02-Apr-2026 to inject 50 IU"
   Output: wrong dose dispensed
-
-  Input:  "difficulty injecting the required prescribed 50 IU dose"
-  Output: injection difficulty
-
-  Input:  "couldn't have the daily dose"
-  Output: drug dose omission
-
-  Input:  "returns of pen because of that"
-  Output: product complaint
 
   Input:  "Bemfola pen 75 IU was given to the patient"
   Output: wrong dose administered
@@ -164,34 +162,112 @@ Examples:
   Input:  "dispensed Bemfola 450 IU as biosimilar for the whole treatment"
   Output: wrong product dispensed
 
+  Input:  "prescribed wrong biosimilar instead of originator"
+  Output: wrong drug prescribed
+
+  Input:  "couldn't have the daily dose"
+  Output: drug dose omission
+
+  Input:  "missed the morning dose"
+  Output: drug dose omission
+
+  Input:  "could not deliver the required dose"
+  Output: drug delivery failure
+
+  Input:  "accidentally took double the dose"
+  Output: accidental overdose
+
+  # ── Device Issues ─────────────────────────────────────────
+  Input:  "difficulty injecting the required prescribed 50 IU dose"
+  Output: injection difficulty
+
+  Input:  "had trouble using the pen device"
+  Output: device use error
+
+  Input:  "thinking that Bemfola is a multiple use pen"
+  Output: device use error
+
+  Input:  "returns of pen because of that"
+  Output: device complaint
+
+  Input:  "patient brought the pen back"
+  Output: device complaint
+
+  Input:  "they are having returns of pen"
+  Output: device complaint
+
+  Input:  "patient returned the device"
+  Output: device complaint
+
+  Input:  "pen was sent back"
+  Output: device complaint
+
+  Input:  "pen stopped working"
+  Output: device malfunction
+
+  Input:  "needle broke during injection"
+  Output: device defect
+
+  # ── Product Quality ───────────────────────────────────────
   Input:  "SPC does not include information on the dose to be injected per pen"
   Output: product information content complaint
 
   Input:  "label does not include dosing information"
   Output: product information content complaint
 
-  Input:  "thinking that Bemfola is a multiple use pen"
-  Output: device use error
+  Input:  "missing information in product leaflet"
+  Output: product information content complaint
 
-  Input:  "patient brought the pen back"
-  Output: device returned by patient
+  Input:  "incorrect information in SPC"
+  Output: misleading product information
 
+  Input:  "information not provided to patient about dose"
+  Output: product information not provided to patient
+
+  Input:  "tablet looked different unusual colour"
+  Output: product quality complaint
+
+  Input:  "found particles in vial"
+  Output: product contamination
+
+  # ── Adverse Events ────────────────────────────────────────
   Input:  "felt nauseous and dizzy after injection"
   Output: nausea and dizziness
 
   Input:  "my temple is paining"
   Output: headache
 
-  Input:  "could not deliver the required dose"
-  Output: drug delivery failure
+  Input:  "head was pounding badly"
+  Output: headache
 
-  Input:  "information not provided to patient about dose"
-  Output: product information not provided to patient
+  Input:  "skin turned red and itchy"
+  Output: rash and pruritus
 
-  Input:  "incorrect information in SPC"
-  Output: misleading product information
+  Input:  "couldn't catch my breath"
+  Output: dyspnoea
+
+  Input:  "tummy felt on fire"
+  Output: abdominal pain
+
+  Input:  "seeing double"
+  Output: diplopia
+
+  Input:  "hands were shaking badly"
+  Output: tremor
+
+  Input:  "felt extremely tired"
+  Output: fatigue
+
+  # ── Lack of Efficacy ──────────────────────────────────────
+  Input:  "blood sugar still high after taking medication"
+  Output: drug ineffective
+
+  Input:  "pain did not go away after treatment"
+  Output: drug ineffective
+
+  Input:  "no improvement after 3 days"
+  Output: lack of efficacy
 """
-
 
 _AGENT_SYSTEM_PROMPT = """
 You are a senior MedDRA coding specialist for Pharmacovigilance case processing.
