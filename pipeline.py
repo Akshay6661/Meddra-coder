@@ -71,7 +71,7 @@ VECTOR_SCORE_MIN    = 0.70       # cosine similarity threshold (0-1)
 
 BM25_CACHE_PATH     = "bm25_index.pkl"
 PINECONE_INDEX_NAME = "meddra-llt"
-EMBED_MODEL_NAME    = "all-MiniLM-L6-v2"
+EMBED_MODEL_NAME    = "sentence-transformers/all-MiniLM-L6-v2"
 
 CONFIDENCE_OK           = 75
 CONFIDENCE_NEEDS_REVIEW = 40
