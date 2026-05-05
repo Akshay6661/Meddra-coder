@@ -132,7 +132,7 @@ with st.sidebar:
 
     st.markdown("""
     <div style='font-size:0.75rem; color:#718096; margin-top:0.5rem;'>
-        <b>Dataset:</b> MedDRA v28.1<br>
+        <b>Dataset:</b> Dummy MedDRA Data <br>
         <b>Model:</b> openai/gpt-oss-120b<br>
     </div>
     """, unsafe_allow_html=True)
