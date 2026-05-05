@@ -64,10 +64,10 @@ COL_LLT_CODE        = "LLT Code"
 COL_DECODE          = "Decode"
 COL_PT_CODE         = "PT Code"
 
-FUZZY_THRESHOLD     = 80
+FUZZY_THRESHOLD     = 90
 BM25_THRESHOLD      = 2.0
 VECTOR_TOP_N        = 3
-VECTOR_SCORE_MIN    = 0.70       # cosine similarity threshold (0-1)
+VECTOR_SCORE_MIN    = 0.55       # cosine similarity threshold (0-1)
 
 BM25_CACHE_PATH     = "bm25_index.pkl"
 PINECONE_INDEX_NAME = "meddra-llt"
