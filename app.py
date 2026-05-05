@@ -99,9 +99,17 @@ EVENT_CONFIG = {
 
 # ─── Load pipeline ────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def load_pipeline(_api_key: str):
-    init_pipeline(api_key=_api_key, excel_path="MedDRA_LLT_PT_v28.1.xlsx")
+def load_pipeline(_api_key: str, _pinecone_key: str):
+    init_pipeline(
+        api_key=_api_key,
+        pinecone_api_key=_pinecone_key,
+        excel_path="MedDRA_LLT_PT_v28.1.xlsx",
+    )
+# Read Pinecone key from secrets
+pinecone_key = st.secrets.get("PINECONE_API_KEY", "")
 
+# Load pipeline
+load_pipeline(api_key, pinecone_key)
 
 # ─── Sidebar ─────────────────────────────────────────────────────
 with st.sidebar:
