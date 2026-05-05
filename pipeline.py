@@ -618,7 +618,11 @@ def run_pipeline(narrative: str) -> List[LLTResult]:
 
     if not coded:
         return []
-
+# ── Cache and return ──────────────────────────────────────────
+# Only cache if we got actual results — never cache empty
+    if results:
+        _result_cache[cache_key] = results
+    return results
     # ── Layer 4: Validate each match ──────────────────────────────
     results = []
     for item in coded:
