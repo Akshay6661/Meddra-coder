@@ -12,3 +12,4 @@ pydantic
 numpy
 pinecone
 fastembed
+tenacity
